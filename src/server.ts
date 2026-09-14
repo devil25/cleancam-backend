@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import { google } from 'googleapis';
+import { Pool } from 'pg';
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -10,6 +11,13 @@ const MONTHLY_PRODUCT_ID = 'premium_monthly';
 const MONTHLY_BASE_PLAN_ID = 'monthly';
 
 app.use(express.json());
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false,
+  },
+});
 
 async function getAndroidPublisher() {
   const auth = new google.auth.GoogleAuth({
@@ -23,10 +31,34 @@ async function getAndroidPublisher() {
 }
 
 app.get('/health', (_req, res) => {
-  res.json({
+  return res.json({
     status: 'ok',
     service: 'cleancam-backend',
   });
+});
+
+/**
+ * Test Supabase PostgreSQL connection.
+ */
+app.get('/db-health', async (_req, res) => {
+  try {
+    const result = await pool.query(
+      'select now() as current_time',
+    );
+
+    return res.json({
+      status: 'ok',
+      database: 'connected',
+      currentTime: result.rows[0].current_time,
+    });
+  } catch (error) {
+    console.error('Database connection failed:', error);
+
+    return res.status(500).json({
+      status: 'error',
+      database: 'disconnected',
+    });
+  }
 });
 
 /**
@@ -117,6 +149,7 @@ app.post('/google-play/rtdn', async (req, res) => {
 
     if (!message || typeof message !== 'object') {
       console.error('RTDN: Missing Pub/Sub message');
+
       return res.status(400).json({
         success: false,
         message: 'Invalid Pub/Sub message',
@@ -241,10 +274,7 @@ app.post('/google-play/rtdn', async (req, res) => {
     );
 
     /**
-     * Important:
-     *
-     * At this stage we only verify and log the authoritative state.
-     * Persistent entitlement storage can be added separately.
+     * Database persistence will be added in the next step.
      */
     return res.status(204).send();
   } catch (error) {
