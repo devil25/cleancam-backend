@@ -2,6 +2,9 @@ import 'dotenv/config';
 import express from 'express';
 import { google } from 'googleapis';
 import { Pool } from 'pg';
+import { OAuth2Client } from 'google-auth-library';
+
+const oidcClient = new OAuth2Client();
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -9,6 +12,12 @@ const PORT = process.env.PORT || 8080;
 const PACKAGE_NAME = 'com.cleancam.ai';
 const MONTHLY_PRODUCT_ID = 'premium_monthly';
 const MONTHLY_BASE_PLAN_ID = 'monthly';
+
+const PUBSUB_SERVICE_ACCOUNT =
+  'pubsub-rtdn-push@cleancam-ai-backend.iam.gserviceaccount.com';
+
+const RTDN_AUDIENCE =
+  'https://cleancam-backend.onrender.com/google-play/rtdn';
 
 app.use(express.json());
 
@@ -28,6 +37,54 @@ async function getAndroidPublisher() {
     version: 'v3',
     auth,
   });
+}
+
+/**
+ * Verify Pub/Sub OIDC authentication.
+ *
+ * Pub/Sub sends an Authorization: Bearer <JWT> header.
+ * We verify:
+ * - JWT signature
+ * - audience
+ * - issuer
+ * - service account email
+ */
+async function verifyPubSubOidcToken(
+  req: express.Request,
+): Promise<void> {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader?.startsWith('Bearer ')) {
+    throw new Error('Missing Pub/Sub OIDC token');
+  }
+
+  const token = authHeader.substring('Bearer '.length).trim();
+
+  if (!token) {
+    throw new Error('Empty Pub/Sub OIDC token');
+  }
+
+  const ticket = await oidcClient.verifyIdToken({
+    idToken: token,
+    audience: RTDN_AUDIENCE,
+  });
+
+  const payload = ticket.getPayload();
+
+  if (!payload) {
+    throw new Error('Invalid OIDC token payload');
+  }
+
+  if (
+    payload.iss !== 'https://accounts.google.com' &&
+    payload.iss !== 'accounts.google.com'
+  ) {
+    throw new Error('Invalid OIDC token issuer');
+  }
+
+  if (payload.email !== PUBSUB_SERVICE_ACCOUNT) {
+    throw new Error('Invalid Pub/Sub service account');
+  }
 }
 
 /**
@@ -219,7 +276,10 @@ app.post('/verify-subscription', async (req, res) => {
       regionCode: subscription.regionCode,
     });
   } catch (error) {
-    console.error('Subscription verification failed:', error);
+    console.error(
+      'Subscription verification failed:',
+      error,
+    );
 
     return res.status(500).json({
       success: false,
@@ -237,11 +297,17 @@ app.post('/verify-subscription', async (req, res) => {
  *
  * Google Play -> Pub/Sub -> this endpoint
  *
- * Pub/Sub sends a push envelope containing:
- * message.data = base64 encoded RTDN JSON
+ * Pub/Sub must authenticate using an OIDC JWT.
  */
 app.post('/google-play/rtdn', async (req, res) => {
   try {
+    /**
+     * SECURITY:
+     * Verify Pub/Sub OIDC authentication BEFORE
+     * processing the request body.
+     */
+    await verifyPubSubOidcToken(req);
+
     const message = req.body?.message;
 
     if (!message || typeof message !== 'object') {
@@ -270,7 +336,9 @@ app.post('/google-play/rtdn', async (req, res) => {
       });
     }
 
-    // Pub/Sub message.data is Base64 encoded.
+    /**
+     * Pub/Sub message.data is Base64 encoded.
+     */
     const decodedData = Buffer.from(
       message.data,
       'base64',
@@ -279,8 +347,8 @@ app.post('/google-play/rtdn', async (req, res) => {
     const notification = JSON.parse(decodedData);
 
     /**
-     * Do NOT log the complete notification because it contains
-     * the purchaseToken.
+     * Do NOT log the complete notification
+     * because it contains the purchaseToken.
      */
     console.log(
       'RTDN notification:',
@@ -295,13 +363,17 @@ app.post('/google-play/rtdn', async (req, res) => {
       }),
     );
 
-    // Make sure the notification belongs to this app.
+    /**
+     * Make sure the notification belongs to this app.
+     */
     if (notification.packageName !== PACKAGE_NAME) {
       console.error(
         `RTDN: Unexpected packageName: ${notification.packageName}`,
       );
 
-      // Acknowledge the message so Pub/Sub does not retry it.
+      /**
+       * Acknowledge the message so Pub/Sub does not retry it.
+       */
       return res.status(204).send();
     }
 
@@ -376,7 +448,7 @@ app.post('/google-play/rtdn', async (req, res) => {
      * The purchase token is used as the database key,
      * but it is never written to application logs.
      */
-     await saveSubscription(purchaseToken.trim(), {
+    await saveSubscription(purchaseToken.trim(), {
       productId: lineItem.productId!,
       basePlanId: lineItem.offerDetails?.basePlanId,
       subscriptionState: subscription.subscriptionState,
@@ -403,7 +475,10 @@ app.post('/google-play/rtdn', async (req, res) => {
 
     return res.status(204).send();
   } catch (error) {
-    console.error('RTDN processing failed:', error);
+    console.error(
+      'RTDN processing failed:',
+      error,
+    );
 
     /**
      * Return 500 so Pub/Sub retries the message.
@@ -419,5 +494,7 @@ app.post('/google-play/rtdn', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`CleanCam Backend running on port ${PORT}`);
+  console.log(
+    `CleanCam Backend running on port ${PORT}`,
+  );
 });
