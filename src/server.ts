@@ -30,6 +30,69 @@ async function getAndroidPublisher() {
   });
 }
 
+/**
+ * Save the current Google Play subscription state in Supabase.
+ */
+async function saveSubscription(
+  purchaseToken: string,
+  data: {
+    productId: string;
+    basePlanId?: string | null;
+    subscriptionState?: string | null;
+    expiryTime?: string | null;
+    autoRenewEnabled: boolean;
+    acknowledgementState?: string | null;
+    regionCode?: string | null;
+  },
+) {
+  await pool.query(
+    `
+      INSERT INTO public.subscriptions (
+        purchase_token,
+        product_id,
+        base_plan_id,
+        subscription_state,
+        expiry_time,
+        auto_renew_enabled,
+        acknowledgement_state,
+        region_code,
+        updated_at
+      )
+      VALUES (
+        $1,
+        $2,
+        $3,
+        $4,
+        $5,
+        $6,
+        $7,
+        $8,
+        now()
+      )
+      ON CONFLICT (purchase_token)
+      DO UPDATE SET
+        product_id = EXCLUDED.product_id,
+        base_plan_id = EXCLUDED.base_plan_id,
+        subscription_state = EXCLUDED.subscription_state,
+        expiry_time = EXCLUDED.expiry_time,
+        auto_renew_enabled = EXCLUDED.auto_renew_enabled,
+        acknowledgement_state = EXCLUDED.acknowledgement_state,
+        region_code = EXCLUDED.region_code,
+        updated_at = now()
+    `,
+    [
+      purchaseToken,
+      data.productId,
+      data.basePlanId ?? null,
+      data.subscriptionState ?? null,
+      data.expiryTime ?? null,
+      data.autoRenewEnabled,
+      data.acknowledgementState ?? null,
+      data.regionCode ?? null,
+    ],
+  );
+}
+
 app.get('/health', (_req, res) => {
   return res.json({
     status: 'ok',
@@ -62,9 +125,10 @@ app.get('/db-health', async (_req, res) => {
 });
 
 /**
- * Flutter -> Backend -> Google Play
+ * Flutter -> Backend -> Google Play -> Supabase
  *
- * Verifies a monthly subscription purchase token.
+ * Verifies a monthly subscription purchase token
+ * and stores the authoritative Google Play state.
  */
 app.post('/verify-subscription', async (req, res) => {
   try {
@@ -80,12 +144,14 @@ app.post('/verify-subscription', async (req, res) => {
       });
     }
 
+    const cleanPurchaseToken = purchaseToken.trim();
+
     const androidPublisher = await getAndroidPublisher();
 
     const response =
       await androidPublisher.purchases.subscriptionsv2.get({
         packageName: PACKAGE_NAME,
-        token: purchaseToken.trim(),
+        token: cleanPurchaseToken,
       });
 
     const subscription = response.data;
@@ -107,6 +173,37 @@ app.post('/verify-subscription', async (req, res) => {
     const isActive =
       subscription.subscriptionState ===
       'SUBSCRIPTION_STATE_ACTIVE';
+
+    /**
+     * Store the authoritative state from Google Play.
+     */
+    await saveSubscription(cleanPurchaseToken, {
+      productId: lineItem.productId!,
+      basePlanId: lineItem.offerDetails?.basePlanId,
+      subscriptionState: subscription.subscriptionState,
+      expiryTime: lineItem.expiryTime,
+      autoRenewEnabled:
+        lineItem.autoRenewingPlan?.autoRenewEnabled ?? false,
+      acknowledgementState:
+        subscription.acknowledgementState,
+      regionCode: subscription.regionCode,
+    });
+
+    console.log(
+      'Subscription verified and saved:',
+      JSON.stringify({
+        productId: lineItem.productId!,
+        basePlanId: lineItem.offerDetails?.basePlanId,
+        subscriptionState:
+          subscription.subscriptionState,
+        expiryTime: lineItem.expiryTime,
+        autoRenewEnabled:
+          lineItem.autoRenewingPlan?.autoRenewEnabled ?? false,
+        acknowledgementState:
+          subscription.acknowledgementState,
+        regionCode: subscription.regionCode,
+      }),
+    );
 
     return res.json({
       success: true,
@@ -181,9 +278,21 @@ app.post('/google-play/rtdn', async (req, res) => {
 
     const notification = JSON.parse(decodedData);
 
+    /**
+     * Do NOT log the complete notification because it contains
+     * the purchaseToken.
+     */
     console.log(
       'RTDN notification:',
-      JSON.stringify(notification),
+      JSON.stringify({
+        version: notification.version,
+        packageName: notification.packageName,
+        eventTimeMillis: notification.eventTimeMillis,
+        hasSubscriptionNotification:
+          Boolean(notification.subscriptionNotification),
+        hasTestNotification:
+          Boolean(notification.testNotification),
+      }),
     );
 
     // Make sure the notification belongs to this app.
@@ -232,7 +341,7 @@ app.post('/google-play/rtdn', async (req, res) => {
     /**
      * RTDN itself does not contain the complete subscription state.
      *
-     * We therefore ask Google Play for the current authoritative state.
+     * Ask Google Play for the current authoritative state.
      */
     const androidPublisher = await getAndroidPublisher();
 
@@ -258,24 +367,40 @@ app.post('/google-play/rtdn', async (req, res) => {
       return res.status(204).send();
     }
 
+    const autoRenewEnabled =
+      lineItem.autoRenewingPlan?.autoRenewEnabled ?? false;
+
+    /**
+     * Save the authoritative state from Google Play.
+     *
+     * The purchase token is used as the database key,
+     * but it is never written to application logs.
+     */
+     await saveSubscription(purchaseToken.trim(), {
+      productId: lineItem.productId!,
+      basePlanId: lineItem.offerDetails?.basePlanId,
+      subscriptionState: subscription.subscriptionState,
+      expiryTime: lineItem.expiryTime,
+      autoRenewEnabled,
+      acknowledgementState:
+        subscription.acknowledgementState,
+      regionCode: subscription.regionCode,
+    });
+
     console.log(
-      'RTDN current Google Play state:',
+      'RTDN subscription state saved:',
       JSON.stringify({
         subscriptionState:
           subscription.subscriptionState,
         productId: lineItem.productId,
         basePlanId: lineItem.offerDetails?.basePlanId,
         expiryTime: lineItem.expiryTime,
-        autoRenewEnabled:
-          lineItem.autoRenewingPlan?.autoRenewEnabled ?? false,
+        autoRenewEnabled,
         acknowledgementState:
           subscription.acknowledgementState,
       }),
     );
 
-    /**
-     * Database persistence will be added in the next step.
-     */
     return res.status(204).send();
   } catch (error) {
     console.error('RTDN processing failed:', error);
